@@ -1,0 +1,368 @@
+---
+title: "Electricity Demand"
+output: html_document
+date: "2024-10-22"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+This project uses the vic_elec data available from the tsibbledata package in R. It reflects aggregated electricity demand for Victoria, Australia, measured in half-hour intervals
+It also includes features such as temperature and a holiday indicator  
+
+The dataset spans three years, ranging from January, 2012 to December, 2014.  
+
+Our task is to build a time series model that predicts future electricity demand based on previous demands.  
+
+The aim is to predict not just a single future value but several future values in a sequence.  
+
+This process is useful when we want to forecast a variable (like electricity demand) for an extended period, such as an entire week. 
+
+
+
+```{r}
+# Load the libraries
+
+library(tidyverse)
+library(tsibble)       # Tidy temporal data frames and tools
+library(feasts)       # Feature Extraction and Statistics for Time Series
+library(tsibbledata)    # diverse data sets for tsibble
+library(fabletools)
+library(fable)
+
+library(torch)
+library(luz)
+```
+
+```{r}
+tsibbledata::vic_elec
+glimpse(vic_elec)
+```
+
+**EDA**
+
+```{r}
+# Decomposing the vic_elec data into trend, seasonal, and remainder(residuals) using the feasts package to gain an understanding of the periodicities that are present in the data
+
+# For a single year:
+
+decomp <- vic_elec %>%
+  filter(year(Date) == 2012) %>%
+  model(STL(Demand)) %>%
+  components()
+
+decomp %>% autoplot()
+
+# For a single month
+
+decomp <- vic_elec %>% 
+  filter(year(Date) == 2012, month(Date) == 1) %>% 
+  model(STL(Demand)) %>% 
+  components()
+
+decomp %>% autoplot()
+```
+
+**Data Preparation**
+
+```{r}
+# We split the data into training, validation, and test sets based on years (since the data set covers three years of hourly data)
+# The split will help us evaluate how well the model generalizes to new data
+
+demand_hourly <- vic_elec %>% 
+  index_by(Hour = floor_date(Time, "hour")) %>% 
+  summarise(Demand = sum(Demand))
+
+demand_hourly %>% head
+
+demand_train <- demand_hourly %>% 
+  filter(year(Hour) == 2012) %>% 
+  as_tibble() %>% 
+  select(Demand) %>% 
+  as.matrix()
+
+demand_train %>% head
+
+
+demand_valid <- demand_hourly %>% 
+  filter(year(Hour) == 2013) %>% 
+  as_tibble() %>% 
+  select(Demand) %>% 
+  as.matrix()
+
+demand_valid %>% head()
+
+
+demand_test <- demand_hourly %>% 
+  filter(year(Hour) == 2014) %>% 
+  as_tibble() %>% 
+  select(Demand) %>% 
+  as.matrix()
+
+demand_test %>% head
+
+
+# Normalization
+train_mean <- mean(demand_train)
+train_sd <- sd(demand_train)
+```
+
+*Dataset*
+
+```{r}
+demand_dataset <- dataset(
+  name = "demand_dataset",                      # Name of the dataset
+  initialize = function(x,                      # Initialize with input data `x`
+                        n_timesteps,            # The number of past time steps used for prediction
+                        n_forecast,             # The number of time steps we want to forecast
+                        sample_frac = 1) {      # Fraction of the data to sample
+    self$n_timesteps <- n_timesteps             # Store number of input time steps
+    self$n_forecast <- n_forecast               # Store number of forecast steps
+    self$x <- torch_tensor((x - train_mean) / train_sd) # Normalize data using training mean and std
+    
+    n <- length(self$x) - self$n_timesteps - self$n_forecast + 1 # Number of available data points
+    self$starts <- sort(sample.int(            # Random sampling of data points
+      n = n,
+      size = n * sample_frac
+    ))
+  },
+  
+  .getitem = function(i) {                     # Define how to get a data point
+    start <- self$starts[i]                    # Start index of the input sequence
+    end <- start + self$n_timesteps - 1        # End index of the input sequence
+    list(
+      x = self$x[start:end],                   # Input sequence (past data)
+      y = self$x[(end + 1):(end + self$n_forecast)]$squeeze(2)  # Target sequence (future data)
+    )
+  },
+  
+  .length = function() {                       # Length of the dataset (how many samples)
+    length(self$starts)
+  }
+)
+
+```
+
+
+```{r}
+# Creating data sets
+
+n_timesteps <- 7 * 24  # 7 days of hourly data (168 hours)
+n_forecast <- 7 * 24   # Forecast 7 days ahead
+
+train_ds <- demand_dataset(demand_train, n_timesteps, n_forecast, sample_frac = 1)
+#train_ds[1]
+
+valid_ds <- demand_dataset(demand_valid, n_timesteps, n_forecast, sample_frac = 1)
+#valid_ds[1]
+
+test_ds <- demand_dataset(demand_test, n_timesteps, n_forecast)
+#test_ds[1]
+
+# We use 7 * 24 because we are forecasting hourly data for an entire week (7 days × 24 hours).
+
+batch_size <- 128
+
+train_dl <- train_ds %>%
+  dataloader(batch_size = batch_size, shuffle = TRUE)
+
+valid_dl <- valid_ds %>%
+  dataloader(batch_size = batch_size)
+
+test_dl <- test_ds %>%
+  dataloader(batch_size = length(test_ds))
+```
+
+**Model definition**
+
+```{r}
+# The final layers uses a multi layer perceptron, this returns n_forecast predictions for each time step
+
+elecModel <- nn_module(
+  initialize = function(input_size,            # Number of input features (1 for univariate)
+                        hidden_size,           # Number of hidden units in LSTM
+                        linear_size,           # Number of hidden units in MLP
+                        output_size,           # Number of forecast time steps (n_forecast)
+                        dropout = 0.2,         # Dropout rate
+                        num_layers = 1,        # Number of LSTM layers
+                        rec_dropout = 0) {     # Recurrent dropout rate
+    self$num_layers <- num_layers              # Store the number of LSTM layers
+    self$rnn <- nn_lstm(                       # Define the LSTM
+      input_size = input_size,
+      hidden_size = hidden_size,
+      num_layers = num_layers,
+      dropout = rec_dropout,
+      batch_first = TRUE                       # Batch first format
+    )
+    self$dropout <- nn_dropout(dropout)        # Add dropout
+    self$mlp <- nn_sequential(                 # Define the MLP for multi-step forecasting
+      nn_linear(hidden_size, linear_size),     # Linear layer
+      nn_relu(),                              # ReLU activation
+      nn_dropout(dropout),                    # Dropout
+      nn_linear(linear_size, output_size)      # Output layer producing n_forecast predictions
+    )
+  },
+  
+  forward = function(x) {                      # Define forward pass
+    x <- self$rnn(x)[[2]][[1]][self$num_layers, , ] %>%   # Output from LSTM layer
+      self$mlp()                               # Pass through MLP
+  }
+)
+
+```
+
+**Hyper parameters**
+
+```{r}
+input_size <- 1       # Only one feature (univariate time series)
+hidden_size <- 32     # Number of units in the LSTM layer
+linear_size <- 512    # Number of units in the MLP
+dropout <- 0.5        # Dropout rate
+num_layers <- 2       # Number of LSTM layers
+rec_dropout <- 0.2    # Recurrent dropout
+```
+
+**Learning rate finder**
+
+```{r}
+elecModel <- elecModel %>%
+  setup(optimizer = optim_adam, loss = nn_mse_loss()) %>%
+  set_hparams(input_size = input_size,
+              hidden_size = hidden_size,
+              linear_size = linear_size,
+              output_size = n_forecast,
+              num_layers = num_layers,
+              rec_dropout = rec_dropout)
+
+
+# Find learning rate
+rates_and_loss <- elecModel %>% lr_finder(
+  train_dl,
+  start_lr = 1e-4,
+  end_lr = 0.5
+)
+
+rates_and_loss %>% plot()
+
+```
+
+**Model training**
+
+```{r}
+# Train the model with early stopping and learning rate scheduling
+fittedElec <- elecModel %>%
+  fit(train_dl, epochs = 100, valid_data = valid_dl,
+      callbacks = list(
+        luz_callback_early_stopping(patience = 3),
+        luz_callback_lr_scheduler(
+          lr_one_cycle,
+          max_lr = 0.01,
+          epochs = 100,
+          steps_per_epoch = length(train_dl),
+          call_on = "on_batch_end")
+      ),
+      verbose = TRUE)
+
+```
+
+**Model Evaluation**
+
+```{r}
+fittedElec %>% 
+  evaluate(test_dl)
+```
+
+```{r}
+# Visualizing the last month only
+
+demand_viz <- demand_hourly %>% 
+  filter(year(Hour) == 2014, month(Hour) == 12)
+
+demand_viz_matrix <- demand_viz %>% 
+  as_tibble() %>% 
+  select(Demand) %>% 
+  as.matrix()
+
+demand_viz_matrix %>% head
+
+
+n_obs <- nrow(demand_viz_matrix)
+n_obs
+
+viz_ds <- demand_dataset(demand_viz_matrix, n_timesteps, n_forecast)   # prepares the data set for making predictions
+# viz_ds[1]
+length(viz_ds)
+
+viz_dl <- dataloader(viz_ds, batch_size = length(viz_ds))
+```
+
+
+```{r}
+# Making predictions
+
+preds <- predict(fittedElec, viz_dl)
+preds <- preds$to(device = "cpu") %>% as.matrix()
+
+preds %>% head(2)
+```
+
+Three sample indices (1, 201, and 401) are chosen from the predictions to visualize.  
+
+For each index, the corresponding prediction values are extracted, and NA is added to align the predictions with the original time series data. This is done using rep(NA, n_timesteps + cur_obs - 1) before the prediction and after the prediction.  
+
+A new dataframe pred_ts is created, adding columns p1, p2, and p3 for the three selected predictions.  
+
+These predictions are de-normalized and combined with the actual demand values.
+
+
+```{r}
+example_preds <- vector(mode = "list", length = 3)
+example_indices <- c(1, 201, 401)
+
+for (i in seq_along(example_indices)) {
+  cur_obs <- example_indices[i]
+  example_preds[[i]] <- c(
+    rep(NA, n_timesteps + cur_obs - 1),
+    preds[cur_obs, ],
+    rep(NA, n_obs - cur_obs + 1 - n_timesteps - n_forecast)
+  )
+}
+
+example_preds[[1]]
+```
+
+```{r}
+# combining predictions and actual values
+
+pred_ts <- demand_viz %>%
+  select(Demand) %>%
+  add_column(
+    p1 = example_preds[[1]] * train_sd + train_mean,
+    p2 = example_preds[[2]] * train_sd + train_mean,
+    p3 = example_preds[[3]] * train_sd + train_mean
+  ) %>%
+  pivot_longer(-Hour) %>%
+  update_tsibble(key = name)
+
+#pred_ts %>% View()
+
+pred_ts %>%
+  autoplot() +
+  scale_colour_manual(
+    values = c(
+      "#08c5d1", "#00353f", "#ffbf66", "#d46f4d"
+    )
+  ) +
+  theme_minimal() +
+  theme(legend.position = "None")
+
+```
+
+The daily and weekly rythms are present in the above plot. Though there are some mini-trends that develop over the month
+
+
+
+
+
+
