@@ -1,0 +1,330 @@
+---
+title: "Apple Stock Price Forecasting"
+output: html_document
+date: "2024-10-22"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning=FALSE, message=FALSE)
+```
+
+In this project, I build a time series forecasting model to predict the Open price of Apple Stocks using LSTM in torch. The network uses a sequence of observations to predict a value for the very next point in time.
+
+The project utilizes the AAPL dataset from Kaggle.
+
+```{r}
+# Load the libraries
+
+library(tidyverse)
+library(torch)
+library(luz)
+
+library(tsibble)
+library(feasts)
+library(fabletools)
+```
+
+
+```{r}
+AAPL <- read_csv("AAPL.csv")
+glimpse(AAPL)
+
+# convert to a tsibble
+
+AAPL <- AAPL %>% 
+  as_tsibble(index = Date)
+```
+
+**Data Inspection**
+
+```{r}
+summary(AAPL)   # The data spans from 1980-12-12 to 2022-06-17
+
+class(AAPL$Date)
+```
+
+```{r}
+
+# To know what kind of periodicities there are in the data, I filtered the data to only include the 5th month of 2022 to obtain a decomposition into trend, various seasonal components and a remainder using feasts::STL()
+
+#AAPL_2022 <- AAPL %>% 
+#  filter(year(Date) == 2022)
+
+#AAPL_2022_plot <- AAPL_2022 %>% 
+#  filter(month(Date) == 5) %>% 
+#  model(STL(Open)) %>% 
+#  components()
+
+#AAPL_2022_plot %>% autoplot()
+
+```
+
+```{r}
+# select columns to be used in the model
+
+df <- AAPL %>% 
+  as_tibble() %>% 
+  select(-Date)
+
+glimpse(df)
+```
+
+**Data Preparation**
+
+```{r}
+# Create dataset with past 14 days of data as features and 1 day ahead as target
+
+AAPL_dataset <- dataset(
+  name = "AAPL_dataset",
+  initialize = function(x, n_timesteps, sample_frac = 1){
+    
+    self$n_timesteps <- n_timesteps
+    self$x <- torch_tensor(as.matrix(apply(x, 2, scaler)))
+    
+    n <- nrow(self$x) - self$n_timesteps
+    self$starts <- sort(sample.int(n = n,
+                                   size = n * sample_frac))
+    
+  },
+  
+  .getitem = function(i){
+    start <- self$starts[i]
+    end <- start + n_timesteps - 1
+    
+    list(
+      x = self$x[start:end, ],
+      y = self$x[end + 1, 1]$unsqueeze(1)
+    )
+  },
+  
+  .length = function(){
+    length(self$starts)
+  }
+)
+
+
+n_timesteps <- 14
+
+```
+
+
+```{r}
+# Split train-test data
+train_size <- round(0.6 * nrow(df))
+train_df <- df[1:train_size, ]
+test_df <- df[(train_size + 1):nrow(df), ]
+```
+
+
+```{r}
+# Data scaling
+# I scale the data into a range of 0-1 using a min max function
+# This scaler will be passed into the above AAPL_dataset() function
+
+scaler <- function(x) (x - min(x)) / (max(x) - min(x))
+a <- c(23, 12, 15, 26)
+scaler(a)
+```
+
+**Data sets and data loaders**
+
+```{r}
+
+train_ds <- AAPL_dataset(train_df, n_timesteps)
+train_ds[1]
+length(train_ds)
+
+
+test_ds <- AAPL_dataset(test_df, n_timesteps)
+test_ds[1]
+length(test_ds)
+
+
+train_dl <- dataloader(train_ds, batch_size = 128, shuffle = TRUE)
+length(train_dl)
+
+
+# Check if the tensor is in the right shape
+b <- train_dl %>% 
+  dataloader_make_iter() %>% 
+  dataloader_next()
+
+dim(b$x)
+
+
+test_dl <- dataloader(test_ds, batch_size = 128)
+length(test_dl)
+```
+
+**Model definition**
+
+```{r}
+
+modelAAPL <- nn_module(
+  initialize = function(input_size,
+                        hidden_size,
+                        dropout = 0.2,
+                        num_layers = 1,
+                        rec_dropout = 0) {
+    self$num_layers <- num_layers
+    self$rnn <- nn_lstm(
+      input_size = input_size,
+      hidden_size = hidden_size,
+      num_layers = num_layers,
+      dropout = rec_dropout,
+      batch_first = TRUE
+    )
+    
+    self$dropout <- nn_dropout(dropout)
+    self$output <- nn_linear(hidden_size, 1)
+  },
+  
+  forward = function(x){
+    self$rnn(x)[[2]][[1]][self$num_layers, , ] %>% 
+      self$dropout() %>% 
+      self$output()
+  }
+)
+```
+
+
+```{r}
+# Hyper parameters
+
+input_size <- 6
+hidden_size <- 64
+num_layers <- 2
+rec_dropout <- 0.2
+```
+
+**Learning rate finder**
+
+```{r}
+modelAAPL2 <- modelAAPL %>% 
+  setup(optimizer = optim_adam,
+       loss = nn_mse_loss()) %>% 
+  set_hparams(
+    input_size = input_size,
+    hidden_size = hidden_size,
+    num_layers = num_layers,
+    rec_dropout = rec_dropout
+  )
+
+rates_and_loses <- modelAAPL2 %>% 
+  lr_finder(train_dl, start_lr = 0.0001, end_lr = 1)
+
+rates_and_loses %>% plot()
+```
+
+From the above plot, the lowest learning rate is at approximately 0.1
+
+**Model training**
+
+```{r}
+library(luz)
+library(torch)
+
+AAPLfitted <- modelAAPL2 %>% 
+  fit(train_dl, epochs = 100, valid_data = test_dl,
+      callbacks = list(
+        luz_callback_early_stopping(patience = 5),
+        luz_callback_lr_scheduler(
+          lr_one_cycle,
+          max_lr = 0.1,
+          epochs = 100,
+          steps_per_epoch = length(train_dl),
+          call_on = "on_batch_end")
+        ),
+      verbose = TRUE
+      )
+
+AAPLfitted
+
+plot(AAPLfitted)
+
+```
+
+**Visualizing predictions on the test data for the first 6 months of 2022 to ascertain how well the model performs**
+
+```{r}
+AAPL_viz <- AAPL %>% 
+  filter(year(Date) == 2022)
+
+
+AAPL_viz_matrix <- AAPL_viz %>% 
+  as_tibble() %>% 
+  select(-Date) %>% 
+  as.matrix()
+
+AAPL_viz_matrix %>% head
+
+# scale the data
+AAPL_scaled <- apply(AAPL_viz_matrix, 2, scaler)
+```
+
+
+```{r}
+# dataset and data loader
+AAPL_ds <- AAPL_dataset(AAPL_scaled, n_timesteps)
+AAPL_ds[1]
+length(AAPL_ds)
+
+AAPL_dl <- AAPL_ds %>% dataloader(batch_size = length(AAPL_ds))
+length(AAPL_dl)
+```
+
+```{r}
+# predictions
+preds <- predict(AAPLfitted, AAPL_dl)
+preds
+
+preds <- preds$to(device = "cpu") %>% as.matrix() 
+```
+
+Unscale the predictions to return the values to their original scale
+
+```{r}
+# Save the min and max values for each feature before scaling
+mins <- apply(AAPL_viz_matrix, 2, min)
+maxs <- apply(AAPL_viz_matrix, 2, max)
+
+# Function to unscale the predictions
+unscaler <- function(scaled_vals, mins, maxs) {
+  scaled_vals * (maxs - mins) + mins
+}
+
+
+preds_unscaled <- unscaler(preds, mins[1], maxs[1])
+
+preds_unscaled <- c(rep(NA, n_timesteps), preds_unscaled)     # ensure the prediction indices align with the actual values in the AAPL data set
+preds_unscaled
+```
+
+```{r}
+pred_ts <- AAPL_viz %>%
+  add_column(forecast = preds_unscaled) %>% 
+  pivot_longer(c("Open", "forecast")) %>%
+  update_tsibble(key = name) 
+
+pred_ts <- pred_ts %>% 
+  select(Date, value) 
+```
+
+
+```{r}
+# Plotting the predictions
+
+pred_ts %>%
+  autoplot() +
+  scale_colour_manual(values = c("#08c5d1", "#00353f")) +
+  theme_minimal() +
+  theme(legend.position = "None")
+
+```
+
+
+
+
+
+
+
